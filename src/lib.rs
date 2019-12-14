@@ -2,177 +2,40 @@
 //!
 //! [Higham and Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
 
-use ndarray::{
-    prelude::*,
-    ArrayBase,
-    Data,
-    DataMut,
-    Dimension,
-    Ix1,
-    Ix2,
-    s,
-};
+use ndarray::{prelude::*, s, ArrayBase, Data, DataMut, Dimension, Ix1, Ix2};
 use ordered_float::NotNan;
-use rand::{
-    Rng,
-    SeedableRng,
-    thread_rng,
-};
+use rand::{thread_rng, Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256StarStar;
-use std::collections::BTreeSet;
 use std::cmp;
+use std::collections::BTreeSet;
 use std::slice;
+mod linear_operator;
+use linear_operator::LinearOperator;
 
-pub struct Normest1 {
+pub struct Normest1<T: num::Num> {
     n: usize,
     t: usize,
     rng: Xoshiro256StarStar,
-    x_matrix: Array2<f64>,
-    y_matrix: Array2<f64>,
-    z_matrix: Array2<f64>,
-    w_vector: Array1<f64>,
-    sign_matrix: Array2<f64>,
-    sign_matrix_old: Array2<f64>,
+    x_matrix: Array2<T>,
+    y_matrix: Array2<T>,
+    z_matrix: Array2<T>,
+    w_vector: Array1<T>,
+    sign_matrix: Array2<T>,
+    sign_matrix_old: Array2<T>,
     column_is_parallel: Vec<bool>,
     indices: Vec<usize>,
     indices_history: BTreeSet<usize>,
     h: Vec<NotNan<f64>>,
 }
 
-/// A trait to generalize over 1-norm estimates of a matrix `A`, matrix powers `A^m`,
-/// or matrix products `A1 * A2 * ... * An`.
-///
-/// In the 1-norm estimator, one repeatedly constructs a matrix-matrix product between some n×n
-/// matrix X and some other n×t matrix Y. If one wanted to estimate the 1-norm of a matrix m times
-/// itself, X^m, it might thus be computationally less expensive to repeatedly apply
-/// X * ( * ( X ... ( X * Y ) rather than to calculate Z = X^m = X * X * ... * X and then apply Z *
-/// Y. In the first case, one has several matrix-matrix multiplications with complexity O(m*n*n*t),
-/// while in the latter case one has O(m*n*n*n) (plus one more O(n*n*t)).
-///
-/// So in case of t << n, it is cheaper to repeatedly apply matrix multiplication to the smaller
-/// matrix on the RHS, rather than to construct one definite matrix on the LHS.  Of course, this is
-/// modified by the number of iterations needed when performing the norm estimate, sustained
-/// performance of the matrix multiplication method used, etc.
-///
-/// It is at the designation of the user to check what is more efficient: to pass in one definite
-/// matrix or choose the alternative route described here.
-trait LinearOperator {
-    fn multiply_matrix<S>(&self, b: &mut ArrayBase<S, Ix2>, c: &mut ArrayBase<S, Ix2>, transpose: bool)
-        where S: DataMut<Elem=f64>;
-}
-
-impl<S1> LinearOperator for ArrayBase<S1, Ix2>
-    where S1: Data<Elem=f64>,
-{
-    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
-    {
-        let (n_rows, n_cols) = self.dim();
-        assert_eq!(n_rows, n_cols, "Number of rows and columns does not match: `self` has to be a square matrix");
-        let n = n_rows;
-
-        let (b_n, b_t) = b.dim();
-        let (c_n, c_t) = b.dim();
-
-        assert_eq!(n, b_n, "Number of rows of b not equal to number of rows of `self`.");
-        assert_eq!(n, c_n, "Number of rows of c not equal to number of rows of `self`.");
-
-        assert_eq!(b_t, c_t, "Number of columns of b not equal to number of columns of c.");
-
-        let t = b_t;
-
-        let (a_slice, a_layout) = as_slice_with_layout(self).expect("Matrix `self` not contiguous.");
-        let (b_slice, b_layout) = as_slice_with_layout(b).expect("Matrix `b` not contiguous.");
-        let (c_slice, c_layout) = as_slice_with_layout_mut(c).expect("Matrix `c` not contiguous.");
-
-        assert_eq!(a_layout, b_layout);
-        assert_eq!(a_layout, c_layout);
-
-        let layout = a_layout;
-
-        let a_transpose = if transpose {
-            cblas::Transpose::Ordinary
-        } else {
-            cblas::Transpose::None
-        };
-
-        unsafe {
-            cblas::dgemm(
-                layout,
-                a_transpose,
-                cblas::Transpose::None,
-                n as i32,
-                t as i32,
-                n as i32,
-                1.0,
-                a_slice,
-                n as i32,
-                b_slice,
-                t as i32,
-                0.0,
-                c_slice,
-                t as i32,
-            )
-        }
-    }
-}
-
-impl<S1> LinearOperator for [&ArrayBase<S1, Ix2>]
-    where S1: Data<Elem=f64>
-{
-    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
-    {
-        if self.len() > 0 {
-            let mut reversed;
-            let mut forward;
-
-            // TODO: Investigate, if an enum instead of a trait object might be more performant.
-            // This probably doesn't matter for large matrices, but could have a measurable impact
-            // on small ones.
-            let a_iter: &mut dyn DoubleEndedIterator<Item=_> = if transpose {
-                reversed = self.iter().rev();
-                &mut reversed
-            } else {
-                forward = self.iter();
-                &mut forward
-            };
-            let a = a_iter.next().unwrap(); // Ok because of if condition
-            a.multiply_matrix(b, c, transpose);
-
-            // NOTE: The swap in the loop body makes use of the fact that in all instances where
-            // `multiply_matrix` is used, the values potentially stored in `b` are not required
-            // anymore.
-            for a in a_iter {
-                std::mem::swap(b, c);
-                a.multiply_matrix(b, c, transpose);
-            }
-        }
-    }
-}
-
-impl<S1> LinearOperator for (&ArrayBase<S1, Ix2>, usize)
-    where S1: Data<Elem=f64>
-{
-    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase< S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
-    {
-        let a = self.0;
-        let m = self.1;
-        if m > 0 {
-            a.multiply_matrix(b, c, transpose);
-            for _ in 1..m {
-                std::mem::swap(b, c);
-                self.0.multiply_matrix(b, c, transpose);
-            }
-        }
-    }
-}
-
-impl Normest1 {
+impl Normest1<f64> {
     pub fn new(n: usize, t: usize) -> Self {
-        assert!(t <= n, "Cannot have more iteration columns t than columns in the matrix.");
-        let rng = Xoshiro256StarStar::from_rng(&mut thread_rng()).expect("Rng initialization failed.");
+        assert!(
+            t <= n,
+            "Cannot have more iteration columns t than columns in the matrix."
+        );
+        let rng =
+            Xoshiro256StarStar::from_rng(&mut thread_rng()).expect("Rng initialization failed.");
         let x_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
         let y_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
         let z_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
@@ -207,7 +70,8 @@ impl Normest1 {
     }
 
     fn calculate<L>(&mut self, a_linear_operator: &L, itmax: usize) -> f64
-        where L: LinearOperator + ?Sized
+    where
+        L: LinearOperator + ?Sized,
     {
         assert!(itmax > 1, "normest1 is undefined for iterations itmax < 2");
 
@@ -232,12 +96,17 @@ impl Normest1 {
         // lessens the importance of counterexamples (see the comments in the next section).”
         {
             let rng_mut = &mut self.rng;
-            self.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())]);
+            self.x_matrix
+                .mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())]);
             self.x_matrix.column_mut(0).fill(1.);
         }
 
         // Resample the x_matrix to make sure no columns are parallel
-        find_parallel_columns_in(&self.x_matrix, &mut self.y_matrix, &mut self.column_is_parallel);
+        find_parallel_columns_in(
+            &self.x_matrix,
+            &mut self.y_matrix,
+            &mut self.column_is_parallel,
+        );
         for (i, is_parallel) in self.column_is_parallel.iter().enumerate() {
             if *is_parallel {
                 resample_column(&mut self.x_matrix, i, &mut self.rng, &sample);
@@ -251,7 +120,6 @@ impl Normest1 {
         let mut best_index = 0;
 
         'optimization_loop: for k in 0..itmax {
-
             // Y = A X
             a_linear_operator.multiply_matrix(&mut self.x_matrix, &mut self.y_matrix, false);
 
@@ -265,18 +133,15 @@ impl Normest1 {
                 best_index = self.indices[max_norm_index];
                 self.w_vector.assign(&self.y_matrix.column(max_norm_index));
             } else if k > 1 && max_norm <= estimate {
-                break 'optimization_loop
+                break 'optimization_loop;
             }
 
             if k >= itmax {
-                break 'optimization_loop
+                break 'optimization_loop;
             }
 
             // S = sign(Y)
-            assign_signum_of_array(
-                &self.y_matrix,
-                &mut self.sign_matrix
-            );
+            assign_signum_of_array(&self.y_matrix, &mut self.sign_matrix);
 
             // TODO: Combine the test checking for parallelity between _all_ columns between S
             // and S_old with the “if t > 1” test below.
@@ -284,7 +149,11 @@ impl Normest1 {
             // > If every column of S is parallel to a column of Sold, goto (6), end
             //
             // NOTE: We are reusing `y_matrix` here as a temporary value.
-            if are_all_columns_parallel_between(&self.sign_matrix_old, &self.sign_matrix, &mut self.y_matrix) {
+            if are_all_columns_parallel_between(
+                &self.sign_matrix_old,
+                &self.sign_matrix,
+                &mut self.y_matrix,
+            ) {
                 break 'optimization_loop;
             }
 
@@ -328,7 +197,7 @@ impl Normest1 {
 
             // TODO: This test for equality needs an approximate equality test instead.
             if k > 0 && max_h == self.h[best_index].into() {
-                break 'optimization_loop
+                break 'optimization_loop;
             }
 
             // > Sort h so that h_1 >= ... >= h_n and re-order correspondingly.
@@ -336,7 +205,8 @@ impl Normest1 {
             // the indices is relevant.
             {
                 let h_ref = &self.h;
-                self.indices.sort_unstable_by(|i, j| h_ref[*j].cmp(&h_ref[*i]));
+                self.indices
+                    .sort_unstable_by(|i, j| h_ref[*j].cmp(&h_ref[*i]));
             }
 
             self.x_matrix.fill(0.0);
@@ -406,21 +276,24 @@ impl Normest1 {
 
     /// Estimate the 1-norm of matrix `a` using up to `itmax` iterations.
     pub fn normest1<S>(&mut self, a: &ArrayBase<S, Ix2>, itmax: usize) -> f64
-        where S: Data<Elem=f64>,
+    where
+        S: Data<Elem = f64>,
     {
         self.calculate(a, itmax)
     }
 
     /// Estimate the 1-norm of a marix `a` to the power `m` up to `itmax` iterations.
     pub fn normest1_pow<S>(&mut self, a: &ArrayBase<S, Ix2>, m: usize, itmax: usize) -> f64
-        where S: Data<Elem=f64>,
+    where
+        S: Data<Elem = f64>,
     {
         self.calculate(&(a, m), itmax)
     }
 
     /// Estimate the 1-norm of a product of matrices `a1 a2 ... an` up to `itmax` iterations.
     pub fn normest1_prod<S>(&mut self, aprod: &[&ArrayBase<S, Ix2>], itmax: usize) -> f64
-        where S: Data<Elem=f64>,
+    where
+        S: Data<Elem = f64>,
     {
         self.calculate(aprod, itmax)
     }
@@ -436,8 +309,7 @@ impl Normest1 {
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
 /// [`Normest1`]: struct.Normest1.html
-pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
-{
+pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
     let n = a_matrix.dim().1;
@@ -454,8 +326,7 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 /// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_pow(a_matrix: &Array2<f64>, m: usize, t: usize, itmax: usize) -> f64
-{
+pub fn normest1_pow(a_matrix: &Array2<f64>, m: usize, t: usize, itmax: usize) -> f64 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
     let n = a_matrix.dim().1;
@@ -473,8 +344,7 @@ pub fn normest1_pow(a_matrix: &Array2<f64>, m: usize, t: usize, itmax: usize) ->
 /// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_prod(a_matrices: &[&Array2<f64>], t: usize, itmax: usize) -> f64
-{
+pub fn normest1_prod(a_matrices: &[&Array2<f64>], t: usize, itmax: usize) -> f64 {
     assert!(a_matrices.len() > 0);
     let n = a_matrices[0].dim().1;
     let mut normest1 = Normest1::new(n, t);
@@ -486,9 +356,10 @@ pub fn normest1_prod(a_matrices: &[&Array2<f64>], t: usize, itmax: usize) -> f64
 /// Panics if matrices `a` and `b` have different shape and strides, or if either underlying array is
 /// non-contiguous. This is to make sure that the iteration order over the matrices is the same.
 fn assign_signum_of_array<S1, S2, D>(a: &ArrayBase<S1, D>, b: &mut ArrayBase<S2, D>)
-    where S1: Data<Elem=f64>,
-          S2: DataMut<Elem=f64>,
-          D: Dimension
+where
+    S1: Data<Elem = f64>,
+    S2: DataMut<Elem = f64>,
+    D: Dimension,
 {
     assert_eq!(a.strides(), b.strides());
     let (a_slice, a_layout) = as_slice_with_layout(a).expect("Matrix `a` is not contiguous.");
@@ -506,7 +377,8 @@ fn signum_of_slice(source: &[f64], destination: &mut [f64]) {
 
 /// Calculate the onenorm of a vector (an `ArrayBase` with dimension `Ix1`).
 fn vector_onenorm<S>(a: &ArrayBase<S, Ix1>) -> f64
-    where S: Data<Elem=f64>,
+where
+    S: Data<Elem = f64>,
 {
     let stride = a.strides()[0];
     assert!(stride >= 0);
@@ -518,14 +390,13 @@ fn vector_onenorm<S>(a: &ArrayBase<S, Ix1>) -> f64
         unsafe { slice::from_raw_parts(a, total_len) }
     };
 
-    unsafe {
-        cblas::dasum(n_elements as i32, a_slice, stride as i32)
-    }
+    unsafe { cblas::dasum(n_elements as i32, a_slice, stride as i32) }
 }
 
 /// Calculate the maximum norm of a vector (an `ArrayBase` with dimension `Ix1`).
 fn vector_maxnorm<S>(a: &ArrayBase<S, Ix1>) -> f64
-    where S: Data<Elem=f64>
+where
+    S: Data<Elem = f64>,
 {
     let stride = a.strides()[0];
     assert!(stride >= 0);
@@ -537,13 +408,7 @@ fn vector_maxnorm<S>(a: &ArrayBase<S, Ix1>) -> f64
         unsafe { slice::from_raw_parts(a, total_len) }
     };
 
-    let idx = unsafe {
-        cblas::idamax(
-            n_elements as i32,
-            a_slice,
-            stride as i32,
-        ) as usize
-    };
+    let idx = unsafe { cblas::idamax(n_elements as i32, a_slice, stride as i32) as usize };
     f64::abs(a[idx])
 }
 
@@ -580,7 +445,8 @@ fn vector_maxnorm<S>(a: &ArrayBase<S, Ix1>) -> f64
 /// Returns the one-norm of a matrix `a` together with the index of that column for
 /// which the norm is maximal.
 fn matrix_onenorm_with_index<S>(a: &ArrayBase<S, Ix2>) -> (usize, f64)
-    where S: Data<Elem=f64>,
+where
+    S: Data<Elem = f64>,
 {
     let mut max_norm = 0.0;
     let mut max_norm_index = 0;
@@ -606,13 +472,13 @@ fn matrix_onenorm_with_index<S>(a: &ArrayBase<S, Ix2>) -> (usize, f64)
 ///
 /// Panics if arrays `a` and `c` don't have the same dimensions, or if the length of the slice
 /// `column_is_parallel` is not equal to the number of columns in `a`.
-fn find_parallel_columns_in<S1, S2> (
+fn find_parallel_columns_in<S1, S2>(
     a: &ArrayBase<S1, Ix2>,
     c: &mut ArrayBase<S2, Ix2>,
-    column_is_parallel: &mut [bool]
-)
-    where S1: Data<Elem=f64>,
-          S2: DataMut<Elem=f64>
+    column_is_parallel: &mut [bool],
+) where
+    S1: Data<Elem = f64>,
+    S2: DataMut<Elem = f64>,
 {
     let a_dim = a.dim();
     let c_dim = c.dim();
@@ -623,7 +489,8 @@ fn find_parallel_columns_in<S1, S2> (
     assert_eq!(column_is_parallel.len(), n_cols);
     {
         let (a_slice, a_layout) = as_slice_with_layout(a).expect("Matrix `a` is not contiguous.");
-        let (c_slice, c_layout) = as_slice_with_layout_mut(c).expect("Matrix `c` is not contiguous.");
+        let (c_slice, c_layout) =
+            as_slice_with_layout_mut(c).expect("Matrix `c` is not contiguous.");
         assert_eq!(a_layout, c_layout);
         let layout = a_layout;
 
@@ -678,15 +545,17 @@ fn find_parallel_columns_in<S1, S2> (
     // . . . x x
     // . . . . x
 
-    // Don't check more rows than we have columns 
+    // Don't check more rows than we have columns
     'rows: for (i, row) in c.genrows().into_iter().enumerate().take(n_cols) {
         // Skip if the column is already found to be parallel or if we are checking
         // the last column
-        if column_is_parallel[i] || i >= n_cols - 1 { continue 'rows; }
-        for (j, element) in row.slice(s![i+1..]).iter().enumerate() {
+        if column_is_parallel[i] || i >= n_cols - 1 {
+            continue 'rows;
+        }
+        for (j, element) in row.slice(s![i + 1..]).iter().enumerate() {
             // Check if the vectors are parallel or anti-parallel
             if f64::abs(*element) == n_rows as f64 {
-                column_is_parallel[i+j+1] = true;
+                column_is_parallel[i + j + 1] = true;
             }
         }
     }
@@ -707,15 +576,15 @@ fn find_parallel_columns_in<S1, S2> (
 ///
 /// Panics if arrays `a`, `b`, and `c` don't have the same dimensions, or if the length of the slice
 /// `column_is_parallel` is not equal to the number of columns in `a`.
-fn find_parallel_columns_between<S1, S2, S3> (
+fn find_parallel_columns_between<S1, S2, S3>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
     c: &mut ArrayBase<S3, Ix2>,
     column_is_parallel: &mut [bool],
-)
-    where S1: Data<Elem=f64>,
-          S2: Data<Elem=f64>,
-          S3: DataMut<Elem=f64>
+) where
+    S1: Data<Elem = f64>,
+    S2: Data<Elem = f64>,
+    S3: DataMut<Elem = f64>,
 {
     let a_dim = a.dim();
     let b_dim = b.dim();
@@ -765,7 +634,9 @@ fn find_parallel_columns_between<S1, S2, S3> (
     // TODO:  Implement for column major arrays.
     'rows: for (i, row) in c.genrows().into_iter().enumerate().take(n_cols) {
         // Skip if the column is already found to be parallel the last column.
-        if column_is_parallel[i] { continue 'rows; }
+        if column_is_parallel[i] {
+            continue 'rows;
+        }
         for element in row {
             if f64::abs(*element) == n_rows as f64 {
                 column_is_parallel[i] = true;
@@ -775,18 +646,18 @@ fn find_parallel_columns_between<S1, S2, S3> (
     }
 }
 
-
 /// Check if every column in `a` is parallel to some column in `b`.
 ///
 /// Assumes that we have parallelity only if all entries of two columns `a` and `b` are either +1
 /// or -1.
-fn are_all_columns_parallel_between<S1, S2> (
+fn are_all_columns_parallel_between<S1, S2>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S1, Ix2>,
     c: &mut ArrayBase<S2, Ix2>,
 ) -> bool
-    where S1: Data<Elem=f64>,
-          S2: DataMut<Elem=f64>
+where
+    S1: Data<Elem = f64>,
+    S2: DataMut<Elem = f64>,
 {
     let a_dim = a.dim();
     let b_dim = b.dim();
@@ -834,7 +705,9 @@ fn are_all_columns_parallel_between<S1, S2> (
     'rows: for row in c.genrows() {
         for element in row {
             // If a parallel column was found, cut to the next one.
-            if f64::abs(*element) == n_rows as f64 { continue 'rows; }
+            if f64::abs(*element) == n_rows as f64 {
+                continue 'rows;
+            }
         }
         // This return statement should only be reached if not a single column parallel to the
         // current one was found.
@@ -853,12 +726,15 @@ fn resample_parallel_columns<S1, S2, S3, R>(
     rng: &mut R,
     sample: &[f64],
 ) -> bool
-    where S1: DataMut<Elem=f64>,
-          S2: Data<Elem=f64>,
-          S3: DataMut<Elem=f64>,
-          R: Rng
+where
+    S1: DataMut<Elem = f64>,
+    S2: Data<Elem = f64>,
+    S3: DataMut<Elem = f64>,
+    R: Rng,
 {
-    column_is_parallel.iter_mut().for_each(|x| {*x = false;});
+    column_is_parallel.iter_mut().for_each(|x| {
+        *x = false;
+    });
     find_parallel_columns_in(a, c, column_is_parallel);
     find_parallel_columns_between(a, b, c, column_is_parallel);
     let mut has_resampled = false;
@@ -875,18 +751,24 @@ fn resample_parallel_columns<S1, S2, S3, R>(
 ///
 /// Panics if `i` exceeds the number of columns in `a`.
 fn resample_column<R, S>(a: &mut ArrayBase<S, Ix2>, i: usize, rng: &mut R, sample: &[f64])
-    where S: DataMut<Elem=f64>,
-          R: Rng
+where
+    S: DataMut<Elem = f64>,
+    R: Rng,
 {
-    assert!(i < a.dim().1, "Trying to resample column with index exceeding matrix dimensions");
+    assert!(
+        i < a.dim().1,
+        "Trying to resample column with index exceeding matrix dimensions"
+    );
     assert!(sample.len() > 0);
-    a.column_mut(i).mapv_inplace(|_| sample[rng.gen_range(0, sample.len())]);
+    a.column_mut(i)
+        .mapv_inplace(|_| sample[rng.gen_range(0, sample.len())]);
 }
 
 /// Returns slice and layout underlying an array `a`.
-fn as_slice_with_layout<S, T, D>(a: &ArrayBase<S, D>) -> Option<(&[T], cblas::Layout)>
-    where S: Data<Elem=T>,
-          D: Dimension
+pub fn as_slice_with_layout<S, T, D>(a: &ArrayBase<S, D>) -> Option<(&[T], cblas::Layout)>
+where
+    S: Data<Elem = T>,
+    D: Dimension,
 {
     if let Some(a_slice) = a.as_slice() {
         Some((a_slice, cblas::Layout::RowMajor))
@@ -898,14 +780,20 @@ fn as_slice_with_layout<S, T, D>(a: &ArrayBase<S, D>) -> Option<(&[T], cblas::La
 }
 
 /// Returns mutable slice and layout underlying an array `a`.
-fn as_slice_with_layout_mut<S, T, D>(a: &mut ArrayBase<S, D>) -> Option<(&mut [T], cblas::Layout)>
-    where S: DataMut<Elem=T>,
-          D: Dimension
+pub fn as_slice_with_layout_mut<S, T, D>(
+    a: &mut ArrayBase<S, D>,
+) -> Option<(&mut [T], cblas::Layout)>
+where
+    S: DataMut<Elem = T>,
+    D: Dimension,
 {
     if a.as_slice_mut().is_some() {
         Some((a.as_slice_mut().unwrap(), cblas::Layout::RowMajor))
     } else if a.as_slice_memory_order_mut().is_some() {
-        Some((a.as_slice_memory_order_mut().unwrap(), cblas::Layout::ColumnMajor))
+        Some((
+            a.as_slice_memory_order_mut().unwrap(),
+            cblas::Layout::ColumnMajor,
+        ))
     } else {
         None
     }
@@ -926,15 +814,10 @@ fn as_slice_with_layout_mut<S, T, D>(a: &mut ArrayBase<S, D>) -> Option<(&mut [T
 mod tests {
     extern crate openblas_src;
 
-    use ndarray::{
-        prelude::*,
-        Zip,
-    };
+    use ndarray::{prelude::*, Zip};
     use ndarray_rand::RandomExt;
-    use rand::{
-        SeedableRng,
-    };
     use rand::distributions::StandardNormal;
+    use rand::SeedableRng;
     use rand_xoshiro::Xoshiro256Plus;
 
     #[test]
@@ -947,7 +830,7 @@ mod tests {
         let distribution = StandardNormal;
 
         let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
-        a_matrix.mapv_inplace(|x| 1.0/x);
+        a_matrix.mapv_inplace(|x| 1.0 / x);
 
         let unity = Array::eye(n);
 
@@ -969,7 +852,7 @@ mod tests {
         let distribution = StandardNormal;
 
         let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
-        a_matrix.mapv_inplace(|x| 1.0/x);
+        a_matrix.mapv_inplace(|x| 1.0 / x);
 
         let estimate_matrixpow = crate::normest1_pow(&a_matrix, 2, t, itmax);
         let estimate_matrixprod = crate::normest1_prod(&[&a_matrix, &a_matrix], t, itmax);
@@ -1004,24 +887,17 @@ mod tests {
 
         for _ in 0..nsamples {
             let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
-            a_matrix.mapv_inplace(|x| 1.0/x);
+            a_matrix.mapv_inplace(|x| 1.0 / x);
             let estimate = crate::normest1(&a_matrix, t, itmax);
             calculated.push(estimate);
             expected.push({
-                let (a_slice, a_layout) = crate::as_slice_with_layout(&a_matrix).expect("a matrix not contiguous");
+                let (a_slice, a_layout) =
+                    crate::as_slice_with_layout(&a_matrix).expect("a matrix not contiguous");
                 let a_layout = match a_layout {
                     cblas::Layout::ColumnMajor => lapacke::Layout::ColumnMajor,
                     cblas::Layout::RowMajor => lapacke::Layout::RowMajor,
                 };
-                unsafe {
-                    lapacke::dlange(
-                    a_layout,
-                    b'1',
-                    n as i32,
-                    n as i32,
-                    a_slice,
-                    n as i32,
-                )}
+                unsafe { lapacke::dlange(a_layout, b'1', n as i32, n as i32, a_slice, n as i32) }
             });
         }
 
@@ -1034,7 +910,7 @@ mod tests {
             .and(&mut underestimation_ratio)
             .apply(|c, e, u| {
                 *u = *c / *e;
-        });
+            });
 
         let underestimation_mean = underestimation_ratio.mean_axis(Axis(0)).into_scalar();
         assert!(0.99 < underestimation_mean);

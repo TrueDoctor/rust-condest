@@ -14,6 +14,7 @@ keywords = ["condition", "linalg", "matrix", "ndarray", "norm"]
 [dependencies]
 cblas = "0.2"
 lapacke = "0.2"
+num = "0.2"
 ndarray = "0.12"
 ordered-float = "1.0"
 rand = "0.6"
