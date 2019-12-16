@@ -1,10 +1,6 @@
-use ndarray::{prelude::*, s, ArrayBase, Data, DataMut, Dimension, Ix1, Ix2};
-use ordered_float::NotNan;
-use rand::{thread_rng, Rng, SeedableRng};
-use rand_xoshiro::Xoshiro256StarStar;
-use std::cmp;
-use std::collections::BTreeSet;
-use std::slice;
+#![feature(specialization)]
+#![allow(non_camel_case_types)]
+use ndarray::{prelude::*, ArrayBase, Data, DataMut};
 type c64 = num::complex::Complex64;
 type c32 = num::complex::Complex32;
 
@@ -25,8 +21,8 @@ type c32 = num::complex::Complex32;
 ///
 /// It is at the designation of the user to check what is more efficient: to pass in one definite
 /// matrix or choose the alternative route described here.
-pub(crate) trait LinearOperator {
-    fn multiply_matrix<S, T2: num::Num, MM: MatrixMultiplication<T2, T2>>(
+pub(crate) trait LinearOperator<T1: num::Num> {
+    fn multiply_matrix<S, T2: num::Num>(
         &self,
         b: &mut ArrayBase<S, Ix2>,
         c: &mut ArrayBase<S, Ix2>,
@@ -35,14 +31,12 @@ pub(crate) trait LinearOperator {
         S: DataMut<Elem = T2>;
 }
 
-static s_mut: Multiplier = Multiplier {};
-
-trait MatrixMultiplication<T1: num::Num, T2: num::Num> {
+trait MatrixMultiplication<T: num::Num> {
     unsafe fn muliply(
+        &self,
         layout: cblas::Layout,
-        mat_a: &[T1],
-        mat_b: &[T2],
-        result: &mut [T2],
+        mat_b: &[T],
+        result: &mut [T],
         n: i32,
         t: i32,
         a_transpose: cblas::Transpose,
@@ -52,12 +46,23 @@ trait MatrixMultiplication<T1: num::Num, T2: num::Num> {
     }
 }
 
-struct Multiplier;
+unsafe fn muliply<S1: MatrixMultiplication<T2>, T2: num::Num>(
+    _: S1,
+    layout: cblas::Layout,
+    mat_b: &[T2],
+    result: &mut [T2],
+    n: i32,
+    t: i32,
+    a_transpose: cblas::Transpose,
+    b_transpose: cblas::Transpose,
+) {
+    panic!("Number type not implement")
+}
 
-impl MatrixMultiplication<f64, f64> for Multiplier {
+impl MatrixMultiplication<f64> for &[f64] {
     unsafe fn muliply(
+        &self,
         layout: cblas::Layout,
-        mat_a: &[f64],
         mat_b: &[f64],
         result: &mut [f64],
         n: i32,
@@ -74,7 +79,7 @@ impl MatrixMultiplication<f64, f64> for Multiplier {
                 t,
                 n,
                 1.0,
-                mat_a,
+                &self,
                 n,
                 mat_b,
                 t,
@@ -86,10 +91,10 @@ impl MatrixMultiplication<f64, f64> for Multiplier {
     }
 }
 
-impl MatrixMultiplication<f32, f32> for Multiplier {
+impl MatrixMultiplication<f32> for &[f32] {
     unsafe fn muliply(
+        &self,
         layout: cblas::Layout,
-        mat_a: &[f32],
         mat_b: &[f32],
         result: &mut [f32],
         n: i32,
@@ -106,7 +111,7 @@ impl MatrixMultiplication<f32, f32> for Multiplier {
                 t,
                 n,
                 1.0,
-                mat_a,
+                &self,
                 n,
                 mat_b,
                 t,
@@ -118,10 +123,10 @@ impl MatrixMultiplication<f32, f32> for Multiplier {
     }
 }
 
-impl MatrixMultiplication<c64, c64> for Multiplier {
+impl MatrixMultiplication<c64> for &[c64] {
     unsafe fn muliply(
+        &self,
         layout: cblas::Layout,
-        mat_a: &[c64],
         mat_b: &[c64],
         result: &mut [c64],
         n: i32,
@@ -138,7 +143,7 @@ impl MatrixMultiplication<c64, c64> for Multiplier {
                 t,
                 n,
                 c64::new(1.0, 0.0),
-                mat_a,
+                &self,
                 n,
                 mat_b,
                 t,
@@ -150,10 +155,10 @@ impl MatrixMultiplication<c64, c64> for Multiplier {
     }
 }
 
-impl MatrixMultiplication<c32, c32> for Multiplier {
+impl MatrixMultiplication<c32> for &[c32] {
     unsafe fn muliply(
+        &self,
         layout: cblas::Layout,
-        mat_a: &[c32],
         mat_b: &[c32],
         result: &mut [c32],
         n: i32,
@@ -170,7 +175,7 @@ impl MatrixMultiplication<c32, c32> for Multiplier {
                 t,
                 n,
                 c32::new(1.0, 0.0),
-                mat_a,
+                &self,
                 n,
                 mat_b,
                 t,
@@ -182,11 +187,11 @@ impl MatrixMultiplication<c32, c32> for Multiplier {
     }
 }
 
-impl<S1, T1: num::Num> LinearOperator for ArrayBase<S1, Ix2>
+impl<S1, T1: num::Num> LinearOperator<T1> for ArrayBase<S1, Ix2>
 where
     S1: Data<Elem = T1>,
 {
-    fn multiply_matrix<S2, T2: num::Num, MM: MatrixMultiplication<T1, T2>>(
+    fn multiply_matrix<S2, T2: num::Num>(
         &self,
         b: &mut ArrayBase<S2, Ix2>,
         c: &mut ArrayBase<S2, Ix2>,
@@ -239,9 +244,8 @@ where
         };
 
         unsafe {
-            MM::muliply(
+            a_slice.muliply(
                 layout,
-                a_slice,
                 b_slice,
                 c_slice,
                 n as i32,
@@ -253,12 +257,12 @@ where
     }
 }
 
-impl<S1, T1> LinearOperator for [&ArrayBase<S1, Ix2>]
+impl<S1, T1> LinearOperator<T1> for [&ArrayBase<S1, Ix2>]
 where
     S1: Data<Elem = T1>,
     T1: num::Num,
 {
-    fn multiply_matrix<S2, T2, MM: MatrixMultiplication<T2, T2>>(
+    fn multiply_matrix<S2, T2>(
         &self,
         b: &mut ArrayBase<S2, Ix2>,
         c: &mut ArrayBase<S2, Ix2>,
@@ -282,7 +286,7 @@ where
                 &mut forward
             };
             let a = a_iter.next().unwrap(); // Ok because of if condition
-            a.multiply_matrix::<S2, T2, Multiplier>(b, c, transpose);
+            a.multiply_matrix::<S2, T2>(b, c, transpose);
 
             // NOTE: The swap in the loop body makes use of the fact that in all instances where
             // `multiply_matrix` is used, the values potentially stored in `b` are not required
@@ -295,18 +299,18 @@ where
     }
 }
 
-impl<S1, T1> LinearOperator for (&ArrayBase<S1, Ix2>, usize)
+impl<S1, T1> LinearOperator<T1> for (&ArrayBase<S1, Ix2>, usize)
 where
     S1: Data<Elem = T1>,
     T1: num::Num,
 {
-    fn multiply_matrix<S2, T2, MM: MatrixMultiplication<T2, T2>>(
+    fn multiply_matrix<S2, T2>(
         &self,
         b: &mut ArrayBase<S2, Ix2>,
         c: &mut ArrayBase<S2, Ix2>,
         transpose: bool,
     ) where
-        S2: DataMut<Elem = f64>,
+        S2: DataMut<Elem = T2>,
         T2: num::Num,
     {
         let a = self.0;

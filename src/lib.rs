@@ -71,7 +71,7 @@ impl Normest1<f64> {
 
     fn calculate<L>(&mut self, a_linear_operator: &L, itmax: usize) -> f64
     where
-        L: LinearOperator + ?Sized,
+        L: LinearOperator<f64> + ?Sized,
     {
         assert!(itmax > 1, "normest1 is undefined for iterations itmax < 2");
 
