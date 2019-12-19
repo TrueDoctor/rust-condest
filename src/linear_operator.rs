@@ -21,18 +21,22 @@ type c32 = num::complex::Complex32;
 ///
 /// It is at the designation of the user to check what is more efficient: to pass in one definite
 /// matrix or choose the alternative route described here.
-pub(crate) trait LinearOperator<T1: num::Num> {
-    fn multiply_matrix<S, T2: num::Num>(
+pub(crate) trait LinearOperator<S1, S2, T>
+where
+    S1: Data<Elem = T>,
+    S2: DataMut<Elem = T>,
+    T: Num,
+{
+    fn multiply_matrix(
         &self,
-        b: &mut ArrayBase<S, Ix2>,
-        c: &mut ArrayBase<S, Ix2>,
+        b: &mut ArrayBase<S2, Ix2>,
+        c: &mut ArrayBase<S2, Ix2>,
         transpose: bool,
-    ) where
-        S: DataMut<Elem = T2>;
+    );
 }
 
-trait MatrixMultiplication<T: num::Num> {
-    unsafe fn muliply(
+trait MatrixMultiplication<T: Num> {
+    unsafe fn multiply_slice(
         &self,
         layout: cblas::Layout,
         mat_b: &[T],
@@ -46,159 +50,107 @@ trait MatrixMultiplication<T: num::Num> {
     }
 }
 
-unsafe fn muliply<S1: MatrixMultiplication<T2>, T2: num::Num>(
-    _: S1,
-    layout: cblas::Layout,
-    mat_b: &[T2],
-    result: &mut [T2],
-    n: i32,
-    t: i32,
-    a_transpose: cblas::Transpose,
-    b_transpose: cblas::Transpose,
-) {
-    panic!("Number type not implement")
-}
-
-impl MatrixMultiplication<f64> for &[f64] {
-    unsafe fn muliply(
-        &self,
+pub trait Num: num::Num + Copy {
+    unsafe fn gemm(
         layout: cblas::Layout,
-        mat_b: &[f64],
-        result: &mut [f64],
+        a_transpose: cblas::Transpose,
+        b_transpose: cblas::Transpose,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: Self,
+        a: &[Self],
+        lda: i32,
+        b: &[Self],
+        ldb: i32,
+        beta: Self,
+        c: &mut [Self],
+        ldc: i32,
+    );
+    unsafe fn simple_gemm(
+        mat_a: &[Self],
+        layout: cblas::Layout,
+        mat_b: &[Self],
+        result: &mut [Self],
         n: i32,
         t: i32,
         a_transpose: cblas::Transpose,
         b_transpose: cblas::Transpose,
     ) {
-        unsafe {
-            cblas::dgemm(
-                layout,
-                a_transpose,
-                b_transpose,
-                n,
-                t,
-                n,
-                1.0,
-                &self,
-                n,
-                mat_b,
-                t,
-                0.0,
-                result,
-                t,
-            )
-        }
+        Self::gemm(
+            layout,
+            a_transpose,
+            b_transpose,
+            n,
+            t,
+            n,
+            <Self as num::One>::one(),
+            mat_a,
+            n,
+            mat_b,
+            t,
+            <Self as num::Zero>::zero(),
+            result,
+            t,
+        )
     }
 }
-
-impl MatrixMultiplication<f32> for &[f32] {
-    unsafe fn muliply(
-        &self,
-        layout: cblas::Layout,
-        mat_b: &[f32],
-        result: &mut [f32],
-        n: i32,
-        t: i32,
-        a_transpose: cblas::Transpose,
-        b_transpose: cblas::Transpose,
-    ) {
-        unsafe {
-            cblas::sgemm(
-                layout,
-                a_transpose,
-                b_transpose,
-                n,
-                t,
-                n,
-                1.0,
-                &self,
-                n,
-                mat_b,
-                t,
-                0.0,
-                result,
-                t,
-            )
+macro_rules! impl_num {
+    ($t: ty, $f: expr) => {
+        impl Num for $t {
+            unsafe fn gemm(
+                layout: cblas::Layout,
+                a_transpose: cblas::Transpose,
+                b_transpose: cblas::Transpose,
+                m: i32,
+                n: i32,
+                k: i32,
+                alpha: Self,
+                a: &[Self],
+                lda: i32,
+                b: &[Self],
+                ldb: i32,
+                beta: Self,
+                c: &mut [Self],
+                ldc: i32,
+            ) {
+                $f(
+                    layout,
+                    a_transpose,
+                    b_transpose,
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    a,
+                    ldc,
+                    b,
+                    ldb,
+                    beta,
+                    c,
+                    ldc,
+                )
+            }
         }
-    }
+    };
 }
+impl_num!(f64, cblas::dgemm);
+impl_num!(f32, cblas::sgemm);
+impl_num!(c64, cblas::zgemm);
+impl_num!(c32, cblas::cgemm);
 
-impl MatrixMultiplication<c64> for &[c64] {
-    unsafe fn muliply(
-        &self,
-        layout: cblas::Layout,
-        mat_b: &[c64],
-        result: &mut [c64],
-        n: i32,
-        t: i32,
-        a_transpose: cblas::Transpose,
-        b_transpose: cblas::Transpose,
-    ) {
-        unsafe {
-            cblas::zgemm(
-                layout,
-                a_transpose,
-                b_transpose,
-                n,
-                t,
-                n,
-                c64::new(1.0, 0.0),
-                &self,
-                n,
-                mat_b,
-                t,
-                c64::new(0.0, 0.0),
-                result,
-                t,
-            )
-        }
-    }
-}
-
-impl MatrixMultiplication<c32> for &[c32] {
-    unsafe fn muliply(
-        &self,
-        layout: cblas::Layout,
-        mat_b: &[c32],
-        result: &mut [c32],
-        n: i32,
-        t: i32,
-        a_transpose: cblas::Transpose,
-        b_transpose: cblas::Transpose,
-    ) {
-        unsafe {
-            cblas::cgemm(
-                layout,
-                a_transpose,
-                b_transpose,
-                n,
-                t,
-                n,
-                c32::new(1.0, 0.0),
-                &self,
-                n,
-                mat_b,
-                t,
-                c32::new(0.0, 0.0),
-                result,
-                t,
-            )
-        }
-    }
-}
-
-impl<S1, T1: num::Num> LinearOperator<T1> for ArrayBase<S1, Ix2>
+impl<S1, S2, T1> LinearOperator<S1, S2, T1> for ArrayBase<S1, Ix2>
 where
     S1: Data<Elem = T1>,
+    S2: DataMut<Elem = T1>,
+    T1: Num,
 {
-    fn multiply_matrix<S2, T2: num::Num>(
+    fn multiply_matrix(
         &self,
         b: &mut ArrayBase<S2, Ix2>,
         c: &mut ArrayBase<S2, Ix2>,
         transpose: bool,
-    ) where
-        S2: DataMut<Elem = T2>,
-    {
+    ) {
         let (n_rows, n_cols) = self.dim();
         assert_eq!(
             n_rows, n_cols,
@@ -244,7 +196,8 @@ where
         };
 
         unsafe {
-            a_slice.muliply(
+            T1::simple_gemm(
+                a_slice,
                 layout,
                 b_slice,
                 c_slice,
@@ -257,20 +210,18 @@ where
     }
 }
 
-impl<S1, T1> LinearOperator<T1> for [&ArrayBase<S1, Ix2>]
+impl<S1, S2, T1> LinearOperator<S1, S2, T1> for [&ArrayBase<S1, Ix2>]
 where
     S1: Data<Elem = T1>,
-    T1: num::Num,
+    S2: DataMut<Elem = T1>,
+    T1: Num,
 {
-    fn multiply_matrix<S2, T2>(
+    fn multiply_matrix(
         &self,
         b: &mut ArrayBase<S2, Ix2>,
         c: &mut ArrayBase<S2, Ix2>,
         transpose: bool,
-    ) where
-        S2: DataMut<Elem = T2>,
-        T2: num::Num,
-    {
+    ) {
         if self.len() > 0 {
             let mut reversed;
             let mut forward;
@@ -286,7 +237,7 @@ where
                 &mut forward
             };
             let a = a_iter.next().unwrap(); // Ok because of if condition
-            a.multiply_matrix::<S2, T2>(b, c, transpose);
+            a.multiply_matrix(b, c, transpose);
 
             // NOTE: The swap in the loop body makes use of the fact that in all instances where
             // `multiply_matrix` is used, the values potentially stored in `b` are not required
@@ -299,20 +250,18 @@ where
     }
 }
 
-impl<S1, T1> LinearOperator<T1> for (&ArrayBase<S1, Ix2>, usize)
+impl<S1, S2, T1> LinearOperator<S1, S2, T1> for (&ArrayBase<S1, Ix2>, usize)
 where
     S1: Data<Elem = T1>,
-    T1: num::Num,
+    S2: DataMut<Elem = T1>,
+    T1: Num,
 {
-    fn multiply_matrix<S2, T2>(
+    fn multiply_matrix(
         &self,
         b: &mut ArrayBase<S2, Ix2>,
         c: &mut ArrayBase<S2, Ix2>,
         transpose: bool,
-    ) where
-        S2: DataMut<Elem = T2>,
-        T2: num::Num,
-    {
+    ) {
         let a = self.0;
         let m = self.1;
         if m > 0 {
